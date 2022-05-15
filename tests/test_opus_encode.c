@@ -407,7 +407,7 @@ int run_test1(int no_fuzz)
             frame_size=frame[j];
             if((fast_rand()&255)==0)
             {
-               if(opus_encoder_ctl(enc, OPUS_RESET_STATE)!=OPUS_OK)test_failed();
+               if(opus_encoder_ctl(enc, OPUS_RESET_STATE,0)!=OPUS_OK)test_failed();
                if(opus_decoder_ctl(dec, OPUS_RESET_STATE)!=OPUS_OK)test_failed();
                if((fast_rand()&1)!=0)
                {
@@ -613,7 +613,7 @@ int run_test1(int no_fuzz)
    }while(i<SAMPLES*4);
    fprintf(stdout,"    All framesize pairs switching encode, %d frames OK.\n",count);
 
-   if(opus_encoder_ctl(enc, OPUS_RESET_STATE)!=OPUS_OK)test_failed();
+   if(opus_encoder_ctl(enc, OPUS_RESET_STATE,0)!=OPUS_OK)test_failed();
    opus_encoder_destroy(enc);
    if(opus_multistream_encoder_ctl(MSenc, OPUS_RESET_STATE)!=OPUS_OK)test_failed();
    opus_multistream_encoder_destroy(MSenc);

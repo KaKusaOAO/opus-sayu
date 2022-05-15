@@ -112,7 +112,7 @@ struct OpusEncoder {
     opus_val16   delay_buffer[MAX_ENCODER_BUFFER*2];
 #ifndef DISABLE_FLOAT_API
     int          detected_bandwidth;
-    int          nb_no_activity_ms_Q1;
+    int          nb_no_activity_frames;
     opus_val32   peak_signal_energy;
 #endif
     int          nonfinal_frame; /* current frame is not the final in a packet */
@@ -892,29 +892,44 @@ static opus_val32 compute_frame_energy(const opus_val16 *pcm, int frame_size, in
 #endif
 
 /* Decides if DTX should be turned on (=1) or off (=0) */
-static int decide_dtx_mode(opus_int activity,            /* indicates if this frame contains speech/music */
-                           int *nb_no_activity_ms_Q1,    /* number of consecutive milliseconds with no activity, in Q1 */
-                           int frame_size_ms_Q1          /* number of miliseconds in this update, in Q1 */
-                           )
-
+static int decide_dtx_mode(float activity_probability,    /* probability that current frame contains speech/music */
+                           int *nb_no_activity_frames,    /* number of consecutive frames with no activity */
+                           opus_val32 peak_signal_energy, /* peak energy of desired signal detected so far */
+                           const opus_val16 *pcm,         /* input pcm signal */
+                           int frame_size,                /* frame size */
+                           int channels,
+                           int is_silence,                 /* only digital silence detected in this frame */
+                           int arch
+                          )
 {
-   if (!activity)
+   opus_val32 noise_energy;
+
+   if (!is_silence)
    {
-      /* The number of consecutive DTX frames should be within the allowed bounds.
-         Note that the allowed bound is defined in the SILK headers and assumes 20 ms
-         frames. As this function can be called with any frame length, a conversion to
-         milliseconds is done before the comparisons. */
-      (*nb_no_activity_ms_Q1) += frame_size_ms_Q1;
-      if (*nb_no_activity_ms_Q1 > NB_SPEECH_FRAMES_BEFORE_DTX*20*2)
+      if (activity_probability < DTX_ACTIVITY_THRESHOLD)  /* is noise */
       {
-         if (*nb_no_activity_ms_Q1 <= (NB_SPEECH_FRAMES_BEFORE_DTX + MAX_CONSECUTIVE_DTX)*20*2)
+         noise_energy = compute_frame_energy(pcm, frame_size, channels, arch);
+
+         /* but is sufficiently quiet */
+         is_silence = peak_signal_energy >= (PSEUDO_SNR_THRESHOLD * noise_energy);
+      }
+   }
+
+   if (is_silence)
+   {
+      /* The number of consecutive DTX frames should be within the allowed bounds */
+      (*nb_no_activity_frames)++;
+
+      if (*nb_no_activity_frames > NB_SPEECH_FRAMES_BEFORE_DTX)
+      {
+         if (*nb_no_activity_frames <= (NB_SPEECH_FRAMES_BEFORE_DTX + MAX_CONSECUTIVE_DTX))
             /* Valid frame for DTX! */
             return 1;
          else
-            (*nb_no_activity_ms_Q1) = NB_SPEECH_FRAMES_BEFORE_DTX*20*2;
+            (*nb_no_activity_frames) = NB_SPEECH_FRAMES_BEFORE_DTX;
       }
    } else
-      (*nb_no_activity_ms_Q1) = 0;
+      (*nb_no_activity_frames) = 0;
 
    return 0;
 }
@@ -1087,8 +1102,6 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
     int analysis_read_subframe_bak=-1;
     int is_silence = 0;
 #endif
-    opus_int activity = VAD_NO_DECISION;
-
     VARDECL(opus_val16, tmp_prefill);
 
     ALLOC_STACK;
@@ -1155,20 +1168,6 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
      * Otherwise, preserve voice_ratio from the last non-silent frame */
     if (!is_silence)
       st->voice_ratio = -1;
-
-    if (is_silence)
-    {
-       activity = !is_silence;
-    } else if (analysis_info.valid)
-    {
-       activity = analysis_info.activity_probability >= DTX_ACTIVITY_THRESHOLD;
-       if (!activity)
-       {
-           /* Mark as active if this noise frame is sufficiently loud */
-           opus_val32 noise_energy = compute_frame_energy(pcm, frame_size, st->channels, st->arch);
-           activity = st->peak_signal_energy < (PSEUDO_SNR_THRESHOLD * noise_energy);
-       }
-    }
 
     st->detected_bandwidth = 0;
     if (analysis_info.valid)
@@ -1669,11 +1668,20 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
     if (st->mode != MODE_CELT_ONLY)
     {
         opus_int32 total_bitRate, celt_rate;
+        opus_int activity;
 #ifdef FIXED_POINT
        const opus_int16 *pcm_silk;
 #else
        VARDECL(opus_int16, pcm_silk);
        ALLOC(pcm_silk, st->channels*frame_size, opus_int16);
+#endif
+
+        activity = VAD_NO_DECISION;
+#ifndef DISABLE_FLOAT_API
+        if( analysis_info.valid ) {
+            /* Inform SILK about the Opus VAD decision */
+            activity = ( analysis_info.activity_probability >= DTX_ACTIVITY_THRESHOLD );
+        }
 #endif
 
         /* Distribute bits between SILK and CELT */
@@ -2136,7 +2144,8 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
 #ifndef DISABLE_FLOAT_API
     if (st->use_dtx && (analysis_info.valid || is_silence))
     {
-       if (decide_dtx_mode(activity, &st->nb_no_activity_ms_Q1, 2*1000*frame_size/st->Fs))
+       if (decide_dtx_mode(analysis_info.activity_probability, &st->nb_no_activity_frames,
+             st->peak_signal_energy, pcm, frame_size, st->channels, is_silence, st->arch))
        {
           st->rangeFinal = 0;
           data[0] = gen_toc(st->mode, st->Fs/frame_size, curr_bandwidth, st->stream_channels);
@@ -2144,7 +2153,7 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
           return 1;
        }
     } else {
-       st->nb_no_activity_ms_Q1 = 0;
+       st->nb_no_activity_frames = 0;
     }
 #endif
 
@@ -2257,22 +2266,18 @@ opus_int32 opus_encode_float(OpusEncoder *st, const float *pcm, int analysis_fra
 #endif
 
 
-int opus_encoder_ctl(OpusEncoder *st, int request, ...)
+int opus_encoder_ctl(OpusEncoder *st, int request, void* arg)
 {
     int ret;
     CELTEncoder *celt_enc;
-    va_list ap;
-
     ret = OPUS_OK;
-    va_start(ap, request);
-
     celt_enc = (CELTEncoder*)((char*)st+st->celt_enc_offset);
 
     switch (request)
     {
         case OPUS_SET_APPLICATION_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if (   (value != OPUS_APPLICATION_VOIP && value != OPUS_APPLICATION_AUDIO
                  && value != OPUS_APPLICATION_RESTRICTED_LOWDELAY)
                || (!st->first && st->application != value))
@@ -2288,7 +2293,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_APPLICATION_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2298,7 +2303,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_BITRATE_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if (value != OPUS_AUTO && value != OPUS_BITRATE_MAX)
             {
                 if (value <= 0)
@@ -2313,7 +2318,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_BITRATE_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2323,7 +2328,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_FORCE_CHANNELS_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if((value<1 || value>st->channels) && value != OPUS_AUTO)
             {
                goto bad_arg;
@@ -2333,7 +2338,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_FORCE_CHANNELS_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2343,7 +2348,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_MAX_BANDWIDTH_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if (value < OPUS_BANDWIDTH_NARROWBAND || value > OPUS_BANDWIDTH_FULLBAND)
             {
                goto bad_arg;
@@ -2360,7 +2365,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_MAX_BANDWIDTH_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2370,7 +2375,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_BANDWIDTH_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if ((value < OPUS_BANDWIDTH_NARROWBAND || value > OPUS_BANDWIDTH_FULLBAND) && value != OPUS_AUTO)
             {
                goto bad_arg;
@@ -2387,7 +2392,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_BANDWIDTH_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2397,7 +2402,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_DTX_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if(value<0 || value>1)
             {
                goto bad_arg;
@@ -2407,7 +2412,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_DTX_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2417,7 +2422,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_COMPLEXITY_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if(value<0 || value>10)
             {
                goto bad_arg;
@@ -2428,7 +2433,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_COMPLEXITY_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2438,7 +2443,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_INBAND_FEC_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if(value<0 || value>1)
             {
                goto bad_arg;
@@ -2448,7 +2453,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_INBAND_FEC_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2458,7 +2463,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_PACKET_LOSS_PERC_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if (value < 0 || value > 100)
             {
                goto bad_arg;
@@ -2469,7 +2474,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_PACKET_LOSS_PERC_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2479,7 +2484,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_VBR_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if(value<0 || value>1)
             {
                goto bad_arg;
@@ -2490,7 +2495,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_VBR_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2500,7 +2505,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_VOICE_RATIO_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if (value<-1 || value>100)
             {
                goto bad_arg;
@@ -2510,7 +2515,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_VOICE_RATIO_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2520,7 +2525,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_VBR_CONSTRAINT_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if(value<0 || value>1)
             {
                goto bad_arg;
@@ -2530,7 +2535,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_VBR_CONSTRAINT_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2540,7 +2545,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_SIGNAL_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if(value!=OPUS_AUTO && value!=OPUS_SIGNAL_VOICE && value!=OPUS_SIGNAL_MUSIC)
             {
                goto bad_arg;
@@ -2550,7 +2555,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_SIGNAL_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2560,7 +2565,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_LOOKAHEAD_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2572,7 +2577,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_SAMPLE_RATE_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2582,7 +2587,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_FINAL_RANGE_REQUEST:
         {
-            opus_uint32 *value = va_arg(ap, opus_uint32*);
+            opus_uint32 *value = (opus_uint32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2592,7 +2597,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_LSB_DEPTH_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if (value<8 || value>24)
             {
                goto bad_arg;
@@ -2602,7 +2607,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_LSB_DEPTH_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2612,7 +2617,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_EXPERT_FRAME_DURATION_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if (value != OPUS_FRAMESIZE_ARG    && value != OPUS_FRAMESIZE_2_5_MS &&
                 value != OPUS_FRAMESIZE_5_MS   && value != OPUS_FRAMESIZE_10_MS  &&
                 value != OPUS_FRAMESIZE_20_MS  && value != OPUS_FRAMESIZE_40_MS  &&
@@ -2626,7 +2631,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_EXPERT_FRAME_DURATION_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2636,7 +2641,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_PREDICTION_DISABLED_REQUEST:
         {
-           opus_int32 value = va_arg(ap, opus_int32);
+           opus_int32 value = (opus_int32) arg;
            if (value > 1 || value < 0)
               goto bad_arg;
            st->silk_mode.reducedDependency = value;
@@ -2644,7 +2649,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_PREDICTION_DISABLED_REQUEST:
         {
-           opus_int32 *value = va_arg(ap, opus_int32*);
+           opus_int32 *value = (opus_int32*)arg;
            if (!value)
               goto bad_arg;
            *value = st->silk_mode.reducedDependency;
@@ -2652,7 +2657,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if(value<0 || value>1)
             {
                goto bad_arg;
@@ -2662,7 +2667,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_GET_PHASE_INVERSION_DISABLED_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                goto bad_arg;
@@ -2696,7 +2701,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_FORCE_MODE_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             if ((value < MODE_SILK_ONLY || value > MODE_CELT_ONLY) && value != OPUS_AUTO)
             {
                goto bad_arg;
@@ -2706,38 +2711,38 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         break;
         case OPUS_SET_LFE_REQUEST:
         {
-            opus_int32 value = va_arg(ap, opus_int32);
+            opus_int32 value = (opus_int32) arg;
             st->lfe = value;
             ret = celt_encoder_ctl(celt_enc, OPUS_SET_LFE(value));
         }
         break;
         case OPUS_SET_ENERGY_MASK_REQUEST:
         {
-            opus_val16 *value = va_arg(ap, opus_val16*);
+            opus_val16 *value = (opus_val16*)arg;
             st->energy_masking = value;
             ret = celt_encoder_ctl(celt_enc, OPUS_SET_ENERGY_MASK(value));
         }
         break;
         case OPUS_GET_IN_DTX_REQUEST:
         {
-            opus_int32 *value = va_arg(ap, opus_int32*);
+            opus_int32 *value = (opus_int32*)arg;
             if (!value)
             {
                 goto bad_arg;
             }
             if (st->silk_mode.useDTX && (st->prev_mode == MODE_SILK_ONLY || st->prev_mode == MODE_HYBRID)) {
                 /* DTX determined by Silk. */
-                silk_encoder *silk_enc = (silk_encoder*)(void *)((char*)st+st->silk_enc_offset);
-                *value = silk_enc->state_Fxx[0].sCmn.noSpeechCounter >= NB_SPEECH_FRAMES_BEFORE_DTX;
-                /* Stereo: check second channel unless only the middle channel was encoded. */
-                if(*value == 1 && st->silk_mode.nChannelsInternal == 2 && silk_enc->prev_decode_only_middle == 0) {
-                    *value = silk_enc->state_Fxx[1].sCmn.noSpeechCounter >= NB_SPEECH_FRAMES_BEFORE_DTX;
+                int n;
+                void *silk_enc = (char*)st+st->silk_enc_offset;
+                *value = 1;
+                for (n=0;n<st->silk_mode.nChannelsInternal;n++) {
+                    *value = *value && ((silk_encoder*)silk_enc)->state_Fxx[n].sCmn.noSpeechCounter >= NB_SPEECH_FRAMES_BEFORE_DTX;
                 }
             }
 #ifndef DISABLE_FLOAT_API
             else if (st->use_dtx) {
                 /* DTX determined by Opus. */
-                *value = st->nb_no_activity_ms_Q1 >= NB_SPEECH_FRAMES_BEFORE_DTX*20*2;
+                *value = st->nb_no_activity_frames >= NB_SPEECH_FRAMES_BEFORE_DTX;
             }
 #endif
             else {
@@ -2745,9 +2750,10 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
             }
         }
         break;
+
         case CELT_GET_MODE_REQUEST:
         {
-           const CELTMode ** value = va_arg(ap, const CELTMode**);
+           const CELTMode ** value = (CELTMode **)arg;
            if (!value)
            {
               goto bad_arg;
@@ -2760,10 +2766,8 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
             ret = OPUS_UNIMPLEMENTED;
             break;
     }
-    va_end(ap);
     return ret;
 bad_arg:
-    va_end(ap);
     return OPUS_BAD_ARG;
 }
 

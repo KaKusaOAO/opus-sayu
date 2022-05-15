@@ -1177,7 +1177,7 @@ opus_int32 test_enc_api(void)
    cfgs++;
    fprintf(stdout,"    OPUS_GET_SAMPLE_RATE ......................... OK.\n");
 
-   if(opus_encoder_ctl(enc,OPUS_UNIMPLEMENTED)!=OPUS_UNIMPLEMENTED)test_failed();
+   if(opus_encoder_ctl(enc,OPUS_UNIMPLEMENTED,0)!=OPUS_UNIMPLEMENTED)test_failed();
    fprintf(stdout,"    OPUS_UNIMPLEMENTED ........................... OK.\n");
    cfgs++;
 
@@ -1405,7 +1405,7 @@ opus_int32 test_enc_api(void)
    fprintf(stdout,"    OPUS_GET_FINAL_RANGE ......................... OK.\n");
 
    /*Reset the encoder*/
-   if(opus_encoder_ctl(enc, OPUS_RESET_STATE)!=OPUS_OK)test_failed();
+   if(opus_encoder_ctl(enc, OPUS_RESET_STATE, 0)!=OPUS_OK)test_failed();
    cfgs++;
    fprintf(stdout,"    OPUS_RESET_STATE ............................. OK.\n");
 

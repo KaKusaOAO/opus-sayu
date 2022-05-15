@@ -325,7 +325,7 @@ OPUS_EXPORT void opus_encoder_destroy(OpusEncoder *st);
   * @see opus_genericctls
   * @see opus_encoderctls
   */
-OPUS_EXPORT int opus_encoder_ctl(OpusEncoder *st, int request, ...) OPUS_ARG_NONNULL(1);
+OPUS_EXPORT int opus_encoder_ctl(OpusEncoder *st, int request, void* arg) OPUS_ARG_NONNULL(1);
 /**@}*/
 
 /** @defgroup opus_decoder Opus Decoder
